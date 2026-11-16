@@ -1,0 +1,14 @@
+# Build context for docker/app and docker/migrate (repo root)
+**/node_modules
+build
+dist-tools
+.svelte-kit
+.env
+.env.*
+!.env.example
+*.png
+*.md
+docs
+docker
+docker-compose.yml
+**/*.test.ts

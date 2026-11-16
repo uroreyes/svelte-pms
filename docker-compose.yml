@@ -1,0 +1,86 @@
+# Full stack:  docker compose up -d --build   →  http://localhost:${HTTP_PORT:-8088}
+# Dev DB only: docker compose up -d db        →  postgres://pms:pms@localhost:5433/pms
+name: svelte-app
+
+x-database-url: &database-url postgres://pms:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (openssl rand -hex 24)}@db:5432/pms
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (openssl rand -hex 24)}
+      POSTGRES_DB: pms
+    ports:
+      - '127.0.0.1:5433:5432'
+    volumes:
+      - pms_pgdata:/var/lib/postgresql/data
+      - ./scripts/db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U pms -d pms']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: migrations + re-encrypt (exit 2 = some ID documents failed, non-fatal); demo seed only when SEED_DEMO=true.
+  # Also used for the night audit and ID-document key rotation (see README):
+  #   docker compose run --rm migrate node night-audit.mjs
+  #   docker compose run --rm migrate node reencrypt-id-documents.mjs
+  # First install of a real property (empty DB; prints the admin's one-time password once):
+  #   docker compose run --rm migrate node bootstrap.mjs --property-name <name> --slug <slug> --admin-email <email> [--admin-name …] [--timezone …] [--currency …]
+  # Operational data reset (go-live only; dry run without --confirm; stop the app first; see README):
+  #   docker compose run --rm migrate node reset-operational-data.mjs --property <slug> --operator <email> [--confirm <slug>] [--force]
+  migrate:
+    image: hotel-pms/migrate:latest
+    build:
+      context: .
+      dockerfile: docker/migrate/Dockerfile
+    environment:
+      DATABASE_URL: *database-url
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+      SEED_STAFF_PASSWORD: ${SEED_STAFF_PASSWORD:-}
+      SEED_DEMO: ${SEED_DEMO:-false}
+      PII_ENCRYPTION_KEY: ${PII_ENCRYPTION_KEY:?set PII_ENCRYPTION_KEY in .env (<keyId>:<base64 32 bytes>)}
+      PII_ENCRYPTION_PREVIOUS_KEYS: ${PII_ENCRYPTION_PREVIOUS_KEYS:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: 'no'
+
+  app:
+    image: hotel-pms/app:latest
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: *database-url
+      CHANNEL_WEBHOOK_SECRET: ${CHANNEL_WEBHOOK_SECRET:?set CHANNEL_WEBHOOK_SECRET in .env (min 32 chars)}
+      PII_ENCRYPTION_KEY: ${PII_ENCRYPTION_KEY:?set PII_ENCRYPTION_KEY in .env (<keyId>:<base64 32 bytes>)}
+      PII_ENCRYPTION_PREVIOUS_KEYS: ${PII_ENCRYPTION_PREVIOUS_KEYS:-}
+      # Trust nginx for client IP (rate limits) and the public origin (CSRF checks, cookie Secure flag).
+      ADDRESS_HEADER: X-Real-IP
+      PROTOCOL_HEADER: X-Forwarded-Proto
+      HOST_HEADER: X-Forwarded-Host
+    expose:
+      - '3000'
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  nginx:
+    image: hotel-pms/nginx:latest
+    build:
+      context: docker/nginx
+    restart: unless-stopped
+    ports:
+      - '${HTTP_PORT:-8088}:80'
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  pms_pgdata:
